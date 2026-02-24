@@ -101,12 +101,15 @@ class FileLock {
         }
 
         const fd = await open(this.lockFile, 'wx');
-        const lockData = JSON.stringify({
-          pid: process.pid,
-          timestamp: new Date().toISOString()
-        });
-        await writeFile(this.lockFile, lockData);
-        await fd.close();
+        try {
+          const lockData = JSON.stringify({
+            pid: process.pid,
+            timestamp: new Date().toISOString()
+          });
+          await fd.writeFile(lockData);
+        } finally {
+          await fd.close();
+        }
 
         this.acquired = true;
         return true;
@@ -152,8 +155,9 @@ async function loadState() {
     const content = await readFile(STATE_FILE, 'utf-8');
     const state = JSON.parse(content);
 
-    // v3 → v4 迁移
-    if (!state.version || state.version < '4.0.0') {
+    // v3 → v4 迁移（数值比较主版本号，避免字典序 '10.0.0' < '4.0.0' 误判）
+    const major = parseInt(state.version?.split('.')[0] || '0', 10);
+    if (!state.version || major < 4) {
       state.version = '4.0.0';
       if (!state.fileOffsets) state.fileOffsets = {};
       if (!state.lastRunTimestamp) state.lastRunTimestamp = 0;
@@ -338,14 +342,14 @@ async function main() {
     // 读取配置
     const configPath = path.join(USER_HOME_DIR, '.claude', 'stats-config.json');
     if (!existsSync(configPath)) {
-      process.exit(0);
+      return;
     }
 
     const configContent = await readFile(configPath, 'utf-8');
     const config = JSON.parse(configContent);
 
     if (!config.enabled || !config.serverUrl) {
-      process.exit(0);
+      return;
     }
 
     // 加载 state（自动迁移 v3 → v4）
@@ -358,13 +362,13 @@ async function main() {
         lastRun: new Date(state.lastRunTimestamp).toISOString(),
         elapsed: `${((now - state.lastRunTimestamp) / 1000).toFixed(0)}s`
       });
-      process.exit(0);
+      return;
     }
 
     // 获取锁（1 秒快速失败）
     if (!await lock.acquire()) {
       await logger.log('info', 'Lock not acquired, skipping');
-      process.exit(0);
+      return;
     }
 
     await logger.log('info', 'Hook v4 started');
@@ -388,22 +392,26 @@ async function main() {
     const bufferedEntries = buffer?.pendingEntries || [];
     const allEntries = [...bufferedEntries, ...newEntries];
 
+    // 已读取 buffer 内容，立即清除文件避免后续重复合并
+    await clearBuffer();
+
     if (allEntries.length === 0) {
       // 更新时间戳并保存 state
       state.lastRunTimestamp = now;
       await atomicWriteJson(STATE_FILE, state);
       await logger.log('info', 'No data to send, done');
-      process.exit(0);
+      return;
     }
 
     // Phase 2: 预算制发送
     const { totalSent, unsent } = await sendWithBudget(config, allEntries, logger);
 
-    // 处理未发送部分
+    // 处理未发送部分：直接覆盖写入，避免重复合并
     if (unsent.length > 0) {
-      await saveToBuffer(unsent);
-    } else {
-      await clearBuffer();
+      await atomicWriteJson(BUFFER_FILE, {
+        pendingEntries: unsent,
+        lastAttempt: new Date().toISOString()
+      });
     }
 
     // 更新时间戳并保存 state
@@ -415,14 +423,11 @@ async function main() {
       sent: totalSent,
       buffered: unsent.length
     });
-
-    process.exit(0);
   } catch (error) {
     await logger.log('error', 'Fatal error', {
       error: error.message,
       stack: error.stack
     });
-    process.exit(0);
   } finally {
     await lock.release();
   }
@@ -430,7 +435,7 @@ async function main() {
 
 // 如果作为独立脚本运行
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main();
+  main().catch(() => {}).finally(() => process.exit(0));
 }
 
 export { sendWithBudget };
