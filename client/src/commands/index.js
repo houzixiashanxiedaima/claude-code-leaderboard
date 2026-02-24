@@ -84,14 +84,14 @@ export async function initCommand() {
   
   await saveConfig(config);
   
-  // 安装 Hook (使用 v3)
+  // 安装 Hook (使用 v4)
   console.log();
-  console.log(chalk.gray('正在安装 Hook v3...'));
-  
+  console.log(chalk.gray('正在安装 Hook v4...'));
+
   try {
-    await installHook(config, 'v3');
-    console.log(chalk.green('✓ Hook v3 安装成功'));
-    console.log(chalk.gray('  包含: 动态批次、超时保护、进度报告、性能优化'));
+    await installHook(config, 'v4');
+    console.log(chalk.green('✓ Hook v4 安装成功'));
+    console.log(chalk.gray('  包含: 增量扫描、Set去重、节流机制、预算制发送'));
   } catch (error) {
     console.error(chalk.red('✗ Hook 安装失败:'), error.message);
     console.log(chalk.yellow('您可以稍后手动重试'));
@@ -427,7 +427,7 @@ export async function upgradeHookCommand(options = {}) {
   }
   
   const currentVersion = await getCurrentHookVersion();
-  const targetVersion = options.target || 'v3';
+  const targetVersion = options.target || 'v4';
   const isLatest = options.latest || !options.target;
   
   console.log(chalk.blue(`🚀 Hook 升级工具`));
@@ -527,6 +527,14 @@ function getVersionFeatures(version) {
       '性能优化：处理速度提升 4-5 倍',
       '更好的错误恢复：精确记录失败数据',
       '共享模块架构：消除代码重复'
+    ],
+    'v4': [
+      '增量扫描：基于 byte offset 只读新增内容，避免全量扫描',
+      'Set 去重：O(1) 哈希查找，替代 Array.includes O(n)',
+      '节流机制：30 秒内重复触发直接退出',
+      '预算制发送：总共最多 10 秒，无重试，超时立即停止',
+      '快速失败锁：1 秒锁超时，避免长时间等待',
+      '自动迁移：首次运行自动从 v3 state 迁移'
     ]
   };
   
