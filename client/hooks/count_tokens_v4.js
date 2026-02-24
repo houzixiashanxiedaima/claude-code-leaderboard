@@ -88,12 +88,20 @@ class FileLock {
     while (Date.now() - startTime < timeout) {
       try {
         if (existsSync(this.lockFile)) {
-          const lockContent = await readFile(this.lockFile, 'utf-8');
-          const lockData = JSON.parse(lockContent);
-          const lockAge = Date.now() - new Date(lockData.timestamp).getTime();
+          let shouldDelete = false;
+          try {
+            const lockContent = await readFile(this.lockFile, 'utf-8');
+            const lockData = JSON.parse(lockContent);
+            const lockAge = Date.now() - new Date(lockData.timestamp).getTime();
+            // NaN（时间戳无效）或超时均视为过期
+            shouldDelete = !Number.isFinite(lockAge) || lockAge > LOCK_STALE_TIME;
+          } catch {
+            // 文件已删除（ENOENT）或内容损坏（SyntaxError）→ 视为过期
+            shouldDelete = true;
+          }
 
-          if (lockAge > LOCK_STALE_TIME) {
-            await unlink(this.lockFile);
+          if (shouldDelete) {
+            await unlink(this.lockFile).catch(() => {});
           } else {
             await new Promise(r => setTimeout(r, 50));
             continue;
@@ -114,7 +122,7 @@ class FileLock {
         this.acquired = true;
         return true;
       } catch (error) {
-        if (error.code === 'EEXIST') {
+        if (error.code === 'EEXIST' || error.code === 'ENOENT') {
           await new Promise(r => setTimeout(r, 50));
         } else {
           throw error;
@@ -192,19 +200,6 @@ async function loadBuffer() {
   }
 }
 
-async function saveToBuffer(entries) {
-  // 合并已有 buffer
-  const existing = await loadBuffer();
-  const merged = existing?.pendingEntries
-    ? [...existing.pendingEntries, ...entries]
-    : entries;
-
-  await atomicWriteJson(BUFFER_FILE, {
-    pendingEntries: merged,
-    lastAttempt: new Date().toISOString()
-  });
-}
-
 async function clearBuffer() {
   try { await unlink(BUFFER_FILE); } catch { /* noop */ }
 }
@@ -216,10 +211,11 @@ function sendRequest(config, entries, timeout = REQUEST_TIMEOUT) {
   const isHttps = url.protocol === 'https:';
   const httpModule = isHttps ? https : http;
 
+  const basePath = url.pathname.replace(/\/+$/, '');
   const options = {
     hostname: url.hostname,
     port: url.port || (isHttps ? 443 : 80),
-    path: '/api/usage/submit',
+    path: `${basePath}/api/usage/submit`,
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     timeout
@@ -392,31 +388,29 @@ async function main() {
     const bufferedEntries = buffer?.pendingEntries || [];
     const allEntries = [...bufferedEntries, ...newEntries];
 
-    // 已读取 buffer 内容，立即清除文件避免后续重复合并
-    await clearBuffer();
-
     if (allEntries.length === 0) {
-      // 更新时间戳并保存 state
       state.lastRunTimestamp = now;
       await atomicWriteJson(STATE_FILE, state);
       await logger.log('info', 'No data to send, done');
       return;
     }
 
+    // 先持久化 state（含 fileOffsets 和 recentHashes），避免崩溃后重复收集
+    state.lastRunTimestamp = now;
+    await atomicWriteJson(STATE_FILE, state);
+
     // Phase 2: 预算制发送
     const { totalSent, unsent } = await sendWithBudget(config, allEntries, logger);
 
-    // 处理未发送部分：直接覆盖写入，避免重复合并
+    // 发送完成后再清理 buffer，未发完的覆盖写入
     if (unsent.length > 0) {
       await atomicWriteJson(BUFFER_FILE, {
         pendingEntries: unsent,
         lastAttempt: new Date().toISOString()
       });
+    } else {
+      await clearBuffer();
     }
-
-    // 更新时间戳并保存 state
-    state.lastRunTimestamp = now;
-    await atomicWriteJson(STATE_FILE, state);
 
     await logger.log('info', 'Hook v4 completed', {
       collected: newEntries.length,
