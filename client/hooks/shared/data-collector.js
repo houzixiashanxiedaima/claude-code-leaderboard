@@ -4,7 +4,8 @@
 // 避免代码重复，遵循DRY原则
 
 import { readFile, readdir, stat } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, createReadStream } from 'node:fs';
+import { createInterface } from 'node:readline';
 import path from 'node:path';
 import process from 'node:process';
 import { homedir } from 'node:os';
@@ -171,10 +172,164 @@ async function collectNewUsageData(state, logger) {
   return allEntries;
 }
 
-export { 
-  getClaudePaths, 
-  findJsonlFiles, 
-  parseUsageFromLine, 
+// ============ V4 增量扫描函数 ============
+
+// 将 { dayKey: string[] } 转为 { dayKey: Set<string> }，供 O(1) 查找
+function buildHashSets(recentHashes) {
+  const sets = {};
+  for (const [dayKey, hashes] of Object.entries(recentHashes)) {
+    sets[dayKey] = new Set(hashes);
+  }
+  return sets;
+}
+
+// 基于 byte offset 只读新增内容
+async function readFileIncremental(filePath, offsets, hashSets, logger) {
+  const entries = [];
+
+  try {
+    const fileStat = await stat(filePath);
+    const currentSize = fileStat.size;
+    const currentMtime = fileStat.mtimeMs;
+
+    const saved = offsets[filePath];
+
+    // 文件未变（size + mtime 相同）→ 跳过
+    if (saved && saved.size === currentSize && saved.mtime === currentMtime) {
+      return entries;
+    }
+
+    // 确定读取起始位置
+    let startOffset = 0;
+    if (saved) {
+      if (currentSize < saved.size) {
+        // 文件缩小（truncated/rotated）→ 从头扫描
+        if (logger) {
+          await logger.log('debug', 'File truncated, rescanning from start', {
+            file: path.basename(filePath)
+          });
+        }
+      } else {
+        // 文件变大 → 从上次位置继续
+        startOffset = saved.offset;
+      }
+    }
+
+    // 无新内容
+    if (startOffset >= currentSize) {
+      offsets[filePath] = { offset: currentSize, size: currentSize, mtime: currentMtime };
+      return entries;
+    }
+
+    // 流式逐行解析新增部分
+    const stream = createReadStream(filePath, {
+      start: startOffset,
+      encoding: 'utf-8'
+    });
+
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+
+      const entry = parseUsageFromLine(line);
+      if (!entry) continue;
+
+      // O(1) Set 去重
+      const dayKey = entry.timestamp.split('T')[0];
+      if (hashSets[dayKey]?.has(entry.interaction_hash)) continue;
+
+      entries.push(entry);
+    }
+
+    // 更新 offset
+    offsets[filePath] = { offset: currentSize, size: currentSize, mtime: currentMtime };
+
+    if (entries.length > 0 && logger) {
+      await logger.log('debug', 'Incremental read', {
+        file: path.basename(filePath),
+        startOffset,
+        endOffset: currentSize,
+        newEntries: entries.length
+      });
+    }
+  } catch (error) {
+    if (logger) {
+      await logger.log('warn', 'Failed to read file incrementally', {
+        file: filePath,
+        error: error.message
+      });
+    }
+  }
+
+  return entries;
+}
+
+// 增量收集新的使用数据（v4 专用）
+async function collectNewUsageDataIncremental(state, logger) {
+  const claudePaths = getClaudePaths();
+  if (claudePaths.length === 0) {
+    if (logger) await logger.log('warn', 'No Claude config directories found');
+    return [];
+  }
+
+  // 初始化 fileOffsets
+  if (!state.fileOffsets) state.fileOffsets = {};
+
+  // 构建 O(1) 去重 Set
+  const hashSets = buildHashSets(state.recentHashes || {});
+
+  const allEntries = [];
+  const seenFiles = new Set();
+
+  if (logger) await logger.log('info', 'Starting incremental data collection', {
+    claudePaths: claudePaths.length,
+    trackedFiles: Object.keys(state.fileOffsets).length
+  });
+
+  for (const claudePath of claudePaths) {
+    const projectsDir = path.join(claudePath, CLAUDE_PROJECTS_DIR);
+
+    try {
+      const jsonlFiles = await findJsonlFiles(projectsDir);
+
+      for (const file of jsonlFiles) {
+        seenFiles.add(file);
+        const entries = await readFileIncremental(file, state.fileOffsets, hashSets, logger);
+        allEntries.push(...entries);
+      }
+    } catch (error) {
+      if (logger) await logger.log('warn', 'Failed to scan directory', {
+        directory: projectsDir,
+        error: error.message
+      });
+    }
+  }
+
+  // 清理已删除文件的 offset 记录
+  for (const trackedFile of Object.keys(state.fileOffsets)) {
+    if (!seenFiles.has(trackedFile)) {
+      delete state.fileOffsets[trackedFile];
+    }
+  }
+
+  if (logger) {
+    await logger.log('info', 'Incremental collection completed', {
+      newEntries: allEntries.length,
+      trackedFiles: Object.keys(state.fileOffsets).length
+    });
+  }
+
+  return allEntries;
+}
+
+export {
+  getClaudePaths,
+  findJsonlFiles,
+  parseUsageFromLine,
   parseJsonlFile,
-  collectNewUsageData 
+  collectNewUsageData,
+  buildHashSets,
+  readFileIncremental,
+  collectNewUsageDataIncremental
 };

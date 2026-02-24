@@ -18,7 +18,7 @@ export async function installHook(config, version = 'v3', options = {}) {
   await installHookScript(config, version, options);
   
   // 2. 安装共享模块（如果需要）
-  if (version === 'v3' || options.latest) {
+  if (version === 'v3' || version === 'v4' || options.latest) {
     await installSharedModules();
   }
   
@@ -49,6 +49,9 @@ async function installHookScript(config, version = 'v3', options = {}) {
   // 选择对应版本的 Hook 文件
   let hookFile;
   switch(version) {
+    case 'v4':
+      hookFile = 'count_tokens_v4.js';
+      break;
     case 'v3':
       hookFile = 'count_tokens_v3.js';
       break;
@@ -56,7 +59,7 @@ async function installHookScript(config, version = 'v3', options = {}) {
       hookFile = 'count_tokens_v2.js';
       break;
     default:
-      hookFile = 'count_tokens_v3.js'; // 默认使用 v3
+      hookFile = 'count_tokens_v4.js'; // 默认使用 v4
   }
   
   const templatePath = path.join(__dirname, '..', '..', 'hooks', hookFile);
@@ -196,9 +199,18 @@ async function saveHookVersion(version, isLatest = false) {
     version,
     installedAt: new Date().toISOString(),
     isLatest,
-    features: version === 'v3' ? [
+    features: version === 'v4' ? [
+      'incremental-scan',
+      'set-dedup',
+      'throttle-30s',
+      'budget-send-10s',
+      'fast-lock-1s',
+      'state-migration',
+      'shared-modules',
+      'modular-architecture'
+    ] : version === 'v3' ? [
       'state-management',
-      'batch-collection', 
+      'batch-collection',
       'retry-logic',
       'atomic-writes',
       'file-locking',
@@ -209,7 +221,7 @@ async function saveHookVersion(version, isLatest = false) {
       ...(isLatest ? ['shared-modules', 'modular-architecture'] : [])
     ] : version === 'v2' ? [
       'state-management',
-      'batch-collection', 
+      'batch-collection',
       'retry-logic',
       'atomic-writes',
       'file-locking'

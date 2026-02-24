@@ -81,7 +81,7 @@ program
 program
   .command('upgrade-hook')
   .description('Upgrade hook to specified version or latest')
-  .option('--target <version>', 'Target version to upgrade to (v2, v3)', 'v3')
+  .option('--target <version>', 'Target version to upgrade to (v2, v3, v4)', 'v4')
   .option('-f, --force', 'Force upgrade even if already on target version')
   .option('-l, --latest', 'Upgrade to latest version including shared modules')
   .action(upgradeHookCommand);
