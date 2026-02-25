@@ -466,7 +466,7 @@ async function processLargeBuffer(config, logger) {
   const analysis = await analyzeBuffer();
   
   if (!analysis.exists || analysis.entries === 0) {
-    return { processed: 0, remaining: 0, success: true };
+    return { processed: 0, remaining: 0, success: true, sentEntries: [] };
   }
   
   const buffer = await loadBuffer();
@@ -512,7 +512,8 @@ async function processLargeBuffer(config, logger) {
   return {
     processed: result.totalSent,
     remaining: result.failedCount,
-    success: result.failedCount === 0
+    success: result.failedCount === 0,
+    sentEntries: result.sentEntries || []
   };
 }
 
@@ -590,6 +591,12 @@ async function main() {
     
     if (analysis.exists && analysis.entries > 0) {
       const bufferResult = await processLargeBuffer(config, logger);
+
+      if (bufferResult.sentEntries.length > 0) {
+        const bufferState = await loadStateWithValidation();
+        await updateState(bufferState, bufferResult.sentEntries);
+      }
+
       if (!bufferResult.success || bufferResult.remaining > 0) {
         process.exit(0);
       }
