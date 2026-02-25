@@ -50,7 +50,7 @@ const TIMEOUTS = {
 };
 
 const MAX_RETRIES = 3;
-const LOCK_TIMEOUT = 5000;
+const LOCK_TIMEOUT = 1000;
 const LOCK_STALE_TIME = 10000;
 const RETENTION_DAYS = 30;
 const MAX_LOG_SIZE = 10 * 1024 * 1024;
@@ -433,7 +433,7 @@ async function sendBatchOptimized(config, entries, options = {}) {
     
     // 大批次间添加延迟
     if (chunkSize >= CHUNK_SIZES.LARGE && success) {
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, 50));
     }
   }
   
@@ -441,10 +441,13 @@ async function sendBatchOptimized(config, entries, options = {}) {
   const failedEntries = entries.filter((_, index) => !successfulIndices.has(index));
   
   const duration = Date.now() - startTime;
+  const sentEntries = entries.filter((_, index) => successfulIndices.has(index));
+
   const finalStats = {
     success: failedEntries.length === 0,
     totalEntries: entries.length,
     totalSent,
+    sentEntries,
     failedCount: failedEntries.length,
     failedEntries,
     duration: `${(duration / 1000).toFixed(1)}s`,
@@ -463,7 +466,7 @@ async function processLargeBuffer(config, logger) {
   const analysis = await analyzeBuffer();
   
   if (!analysis.exists || analysis.entries === 0) {
-    return { processed: 0, remaining: 0, success: true };
+    return { processed: 0, remaining: 0, success: true, sentEntries: [] };
   }
   
   const buffer = await loadBuffer();
@@ -509,7 +512,8 @@ async function processLargeBuffer(config, logger) {
   return {
     processed: result.totalSent,
     remaining: result.failedCount,
-    success: result.failedCount === 0
+    success: result.failedCount === 0,
+    sentEntries: result.sentEntries || []
   };
 }
 
@@ -549,18 +553,9 @@ async function updateState(state, entries) {
 
 // 收集新数据（使用共享模块）
 async function collectNewUsageDataWithState(logger) {
-  // 加载状态文件
   const state = await loadStateWithValidation();
-  
-  // 使用共享的数据收集功能
   const allEntries = await collectNewUsageData(state, logger);
-  
-  // 更新状态文件
-  if (allEntries.length > 0) {
-    await updateState(state, allEntries);
-  }
-  
-  return allEntries;
+  return { state, entries: allEntries };
 }
 
 // ============ 主流程 ============
@@ -594,22 +589,33 @@ async function main() {
     // 分析缓冲区
     const analysis = await analyzeBuffer();
     
-    if (analysis.strategy !== 'normal') {
-      // 处理大缓冲区
-      await processLargeBuffer(config, logger);
-    } else {
-      // 正常流程：收集和发送新数据
-      await logger.log('info', 'Normal processing mode');
-      const newEntries = await collectNewUsageDataWithState(logger);
-      if (newEntries.length > 0) {
-        const result = await sendBatchOptimized(config, newEntries, {
-          chunkSize: CHUNK_SIZES.NORMAL,
-          logger
-        });
-        
-        if (!result.success && result.failedEntries.length > 0) {
-          await saveToBuffer(result.failedEntries);
-        }
+    if (analysis.exists && analysis.entries > 0) {
+      const bufferResult = await processLargeBuffer(config, logger);
+
+      if (bufferResult.sentEntries.length > 0) {
+        const bufferState = await loadStateWithValidation();
+        await updateState(bufferState, bufferResult.sentEntries);
+      }
+
+      if (!bufferResult.success || bufferResult.remaining > 0) {
+        process.exit(0);
+      }
+    }
+
+    await logger.log('info', 'Normal processing mode');
+    const { state, entries: newEntries } = await collectNewUsageDataWithState(logger);
+    if (newEntries.length > 0) {
+      const result = await sendBatchOptimized(config, newEntries, {
+        chunkSize: CHUNK_SIZES.NORMAL,
+        logger
+      });
+
+      if (result.sentEntries.length > 0) {
+        await updateState(state, result.sentEntries);
+      }
+
+      if (result.failedEntries.length > 0) {
+        await saveToBuffer(result.failedEntries);
       }
     }
     
